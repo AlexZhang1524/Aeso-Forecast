@@ -1,121 +1,122 @@
-"""
-aeso_forecasting
------------------------------------
-Forecasts hourly AESO pool prices using MSTL + AutoARIMA + SeasonalNaive.
-Optimized for readability, efficiency, and modularity.
-"""
-
+import urllib.request
+import ssl
+import json
 import pandas as pd
-import numpy as np
 import matplotlib.pyplot as plt
-from time import time
-from statsforecast import StatsForecast
-from statsforecast.models import MSTL, AutoARIMA, SeasonalNaive
-from utilsforecast.plotting import plot_series
+from datetime import datetime, timedelta
+import numpy as np
 
-# =============================
-# CONFIGURATION
-# =============================
+# ---------------------------------------------------------------------
+# 1. FETCH AESO DATA USING urllib
+# ---------------------------------------------------------------------
+def fetch_aeso_data(days_back=7):
+    import ssl
+    end_date = datetime.now().date()
+    start_date = end_date - timedelta(days=days_back)
 
-CSV_PATH = "//Users//alexzhang//Downloads//HistoricalPoolPriceReport.csv"
-FORECAST_HOURS = 24  # Forecast horizon (hours)
-SEASONALITIES = [24, 24 * 7]  # daily + weekly
-CONFIDENCE_LEVEL = [90]  # prediction intervals
-FREQ = "h"  # hourly data
+    # ✅ Correct AESO public report endpoint
+    url = f"https://api.aeso.ca/report/v1.1/price/poolPrice?startDate={start_date}&endDate={end_date}"
+    headers = {
+        "Cache-Control": "no-cache",
+        "Accept": "application/json"
+    }
 
+    print(f"🔌 Fetching AESO pool prices from {start_date} to {end_date}...")
 
-# =============================
-# DATA LOADING & PREPARATION
-# =============================
+    req = urllib.request.Request(url, headers=headers)
+    ssl_context = ssl._create_unverified_context()
 
-def load_and_prepare_data(csv_path: str) -> pd.DataFrame:
-    """Loads and cleans AESO historical price data."""
-    df = pd.read_csv(csv_path)
-    df.insert(0, "unique_id", "Electricity_Hourly")
+    try:
+        with urllib.request.urlopen(req, context=ssl_context) as response:
+            print(f"✅ Response code: {response.getcode()}")
+            data = json.loads(response.read().decode())
+    except Exception as e:
+        print(f"❌ Error fetching AESO data: {e}")
+        return pd.DataFrame()
 
-    # Keep only relevant columns
-    df = df.rename(columns={"DateTime": "ds", "AIL Demand (MW)": "y"})
-    drop_cols = [c for c in ["30Ravg ($)", "Price ($)"] if c in df.columns]
-    df = df.drop(columns=drop_cols, errors="ignore")
+    pool_data = data.get("return", {}).get("poolPrice", [])
+    if not pool_data:
+        print("⚠️ No pool price data returned.")
+        print("🔍 Response preview:")
+        print(json.dumps(data, indent=2)[:1000])
+        return pd.DataFrame()
 
-    # Parse timestamps and drop invalid entries
+    df = pd.DataFrame(pool_data)
+    df.rename(columns={"begin_datetime_mpt": "ds", "pool_price": "y"}, inplace=True)
     df["ds"] = pd.to_datetime(df["ds"], errors="coerce")
-    df = df.dropna(subset=["ds", "y"]).reset_index(drop=True)
-
-    # Ensure numeric target
     df["y"] = pd.to_numeric(df["y"], errors="coerce")
-    df = df.dropna(subset=["y"])
+    df = df.dropna().sort_values("ds").reset_index(drop=True)
 
-    print(f"✅ Loaded {len(df):,} valid hourly records.")
+    print(f"✅ Retrieved {len(df)} records from AESO.")
     return df
 
 
-# =============================
-# MODEL TRAINING & FORECASTING
-# =============================
+# ---------------------------------------------------------------------
+# 2. SIMPLE FORECAST MODEL
+# ---------------------------------------------------------------------
+def forecast_prices(df, hours_ahead=24):
+    """
+    Simple forecast using linear trend + noise.
+    """
+    if df.empty:
+        print("⚠️ No data to forecast.")
+        return pd.DataFrame()
 
-def train_and_forecast(df: pd.DataFrame, forecast_horizon: int = FORECAST_HOURS) -> pd.DataFrame:
-    """Fits MSTL + SeasonalNaive models and produces forecasts."""
-    mstl = MSTL(season_length=SEASONALITIES, trend_forecaster=AutoARIMA())
-    models = [mstl, SeasonalNaive(season_length=24)]
+    print("📈 Generating simple forecast...")
 
-    sf = StatsForecast(models=models, freq=FREQ)
-    sf = sf.fit(df=df)
+    df_recent = df.tail(48)
+    x = np.arange(len(df_recent))
+    y = df_recent["y"].values
+    coef = np.polyfit(x, y, 1)
+    trend = np.poly1d(coef)
 
-    forecasts = sf.predict(h=forecast_horizon, level=CONFIDENCE_LEVEL)
-    print(f"✅ Forecast generated for next {forecast_horizon} hours.")
-    return forecasts
+    forecast_x = np.arange(len(df_recent), len(df_recent) + hours_ahead)
+    forecast_y = trend(forecast_x) + np.random.normal(0, 2, hours_ahead)
+
+    forecast_dates = [df["ds"].iloc[-1] + timedelta(hours=i+1) for i in range(hours_ahead)]
+    df_forecast = pd.DataFrame({"ds": forecast_dates, "forecast": forecast_y})
+
+    print("✅ Forecast generated successfully.")
+    return df_forecast
 
 
-# =============================
-# VISUALIZATION
-# =============================
-
-def plot_forecasts(y_hist: pd.DataFrame, forecasts: pd.DataFrame, models: list[str]):
-    """Plots actual and forecasted values with confidence intervals."""
-    fig, ax = plt.subplots(figsize=(18, 6))
-    y_hist = y_hist.tail(24 * 7)  # last week for context
-    merged = y_hist.merge(forecasts, how="outer", on=["unique_id", "ds"])
-    merged = merged.set_index("ds")
-
-    # Plot each model forecast
-    for model, color in zip(models, ["orange", "green", "red"]):
-        ax.plot(merged.index, merged["y"], color="black", label="Actual")
-        ax.plot(merged.index, merged[model], color=color, label=f"{model} Forecast", linewidth=2)
-        if f"{model}-lo-90" in merged.columns:
-            ax.fill_between(
-                merged.index,
-                merged[f"{model}-lo-90"],
-                merged[f"{model}-hi-90"],
-                color=color,
-                alpha=0.3,
-                label=f"{model} 90% CI",
-            )
-
-    ax.set_title("AESO Hourly Electricity Forecast", fontsize=18)
-    ax.set_xlabel("Timestamp", fontsize=14)
-    ax.set_ylabel("Electricity Demand (MW)", fontsize=14)
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+# ---------------------------------------------------------------------
+# 3. PLOT RESULTS
+# ---------------------------------------------------------------------
+def plot_results(df, df_forecast):
+    plt.figure(figsize=(14, 6))
+    plt.plot(df["ds"], df["y"], label="Actual Pool Price", linewidth=2)
+    if not df_forecast.empty:
+        plt.plot(df_forecast["ds"], df_forecast["forecast"], linestyle="--", label="Forecast (Next 24h)")
+    plt.title("AESO Pool Price (Historical + Forecast)", fontsize=16)
+    plt.xlabel("Date/Time (MPT)")
+    plt.ylabel("Price ($/MWh)")
+    plt.legend()
+    plt.grid(True)
     plt.tight_layout()
     plt.show()
 
 
-# =============================
-# MAIN EXECUTION
-# =============================
+# ---------------------------------------------------------------------
+# 4. MAIN EXECUTION
+# ---------------------------------------------------------------------
+def main():
+    print("🚀 Starting AESO Forecasting Pipeline...")
+    df_live = fetch_aeso_data(days_back=7)
+
+    if df_live.empty:
+        print("⚠️ No data to process.")
+        return
+
+    df_live.to_csv("AESO_PoolPrice_History.csv", index=False)
+    print("📁 Saved AESO_PoolPrice_History.csv")
+
+    df_forecast = forecast_prices(df_live)
+    df_forecast.to_csv("AESO_PoolPrice_Forecast.csv", index=False)
+    print("📁 Saved AESO_PoolPrice_Forecast.csv")
+
+    plot_results(df_live, df_forecast)
+
 
 if __name__ == "__main__":
-    start_time = time()
-
-    df = load_and_prepare_data(CSV_PATH)
-
-    # Train-test split (last 24 hours as test)
-    df_train, df_test = df[:-FORECAST_HOURS], df[-FORECAST_HOURS:]
-
-    forecasts = train_and_forecast(df_train, forecast_horizon=FORECAST_HOURS)
-
-    elapsed = (time() - start_time) / 60
-    print(f" Training + forecasting completed in {elapsed:.2f} minutes.")
-
-    plot_forecasts(df, forecasts, models=["MSTL", "SeasonalNaive"])
+    main()
